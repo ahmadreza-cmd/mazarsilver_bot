@@ -1,6 +1,8 @@
-# bot.py — Telegram gold bot (stable for Render Free)
-# Runs with polling, opens a tiny HTTP server for port binding,
-# and deletes webhook via a sync HTTP call before polling.
+# bot.py — Telegram gold bot (stable on Render Free)
+# - Polling (no webhook)
+# - Tiny HTTP server for port binding
+# - Sync deleteWebhook (no asyncio.run)
+# - Robust error handler so the app never dies on handler errors
 
 import os, re, time, sys, threading, http.server, socketserver
 from zoneinfo import ZoneInfo
@@ -10,15 +12,13 @@ import requests
 from bs4 import BeautifulSoup
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
+def dprint(*a): print(*a, flush=True)
 
-# ----------------- Logging helper -----------------
-def dprint(*a):
-    print(*a, flush=True)
-
-
-# ----------------- ENV -----------------
+# ===== ENV =====
 RAW_TOKEN = os.getenv("BOT_TOKEN", "")
 BASE_URL = (os.getenv("BASE_URL", "") or "").rstrip("/")
 
@@ -31,16 +31,14 @@ RAW_TOKEN = normalize_ascii_digits(RAW_TOKEN)
 dprint("== DEBUG ==")
 dprint("BOT_TOKEN present:", bool(RAW_TOKEN), "True length:", len(RAW_TOKEN))
 dprint("BASE_URL:", BASE_URL if BASE_URL else "<EMPTY>")
-
 if not RAW_TOKEN:
-    dprint("FATAL: BOT_TOKEN is empty. Set it in Render → Environment.")
+    dprint("FATAL: BOT_TOKEN is empty.")
     time.sleep(10)
     sys.exit(1)
 
 TELEGRAM_TOKEN = RAW_TOKEN
 
-
-# ----------------- Utils -----------------
+# ===== Utils =====
 def to_toman(v):
     if v is None: return None
     return int(round(float(v) / 10.0))
@@ -55,14 +53,12 @@ def now_tehran_str():
     tz = ZoneInfo("Asia/Tehran")
     return datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-
-# ----------------- Sources -----------------
+# ===== Sources =====
 ALANCHAND_GOLD  = "https://alanchand.com/en/gold-price"
 ALANCHAND_COINS = "https://alanchand.com/en/iran-gold-coin-price"
 TGJU_USD_URL    = "https://www.tgju.org/profile/price_dollar_rl"
 
 def _extract_row(text: str, label: str):
-    # expects lines like: market IRR ... real IRR ... bubble IRR(bubble %)
     m = re.search(
         rf"{re.escape(label)}\s+([\d,]+)\s+[-\d\.]+\s+([\d,]+)\s+([\d,]+)\(([-\d\.]+)%\)",
         text
@@ -133,8 +129,8 @@ def fetch_kahroba():
         ins = next((i for i in items if i.get("lVal18AFC") == "کهربا"), (items[0] if items else None))
         if not ins:
             return {"symbol":"کهربا","price_toman":None,"nav_toman":None,"prem_toman":None,"prem_pct":None}
-        code = ins.get("insCode")
 
+        code = ins.get("insCode")
         p = requests.get(
             f"https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceInfo/{code}",
             timeout=15, headers={"User-Agent":"Mozilla/5.0"}
@@ -165,12 +161,10 @@ def fetch_kahroba():
     except Exception:
         return {"symbol":"کهربا","price_toman":None,"nav_toman":None,"prem_toman":None,"prem_pct":None}
 
-
-# ----------------- Build Message -----------------
+# ===== Build message =====
 def build_message() -> str:
     lines = [f"⏱ زمان درخواست (تهران): {now_tehran_str()}"]
-
-    # 1-2) طلا و حباب
+    # طلا
     try:
         g = fetch_gold_and_bubble()
         g18, ms = g["gram18"], g["mesghal"]
@@ -185,15 +179,13 @@ def build_message() -> str:
         ]
     except Exception as e:
         lines += [f"❗️دریافت قیمت طلا خطا: {e!r}"]
-
-    # 3) دلار آزاد
+    # دلار
     try:
         usd = fetch_usd()
         lines += ["—", "③ دلار آزاد:", f"• قیمت: {fmt(usd['usd_toman'])} تومان"]
     except Exception as e:
         lines += [f"— ③ دلار آزاد: خطا: {e!r}"]
-
-    # 4-5) سکه و حباب
+    # سکه
     try:
         c = fetch_coins()
         em, hf, qr = c.get("emami"), c.get("half"), c.get("quarter")
@@ -204,4 +196,85 @@ def build_message() -> str:
         lines += ["⑤ حباب سکه:"]
         if em: lines.append(f"• امامی: {fmt(em['bubble_toman'])} تومان ({pct(em['bubble_pct'])})")
         if hf: lines.append(f"• نیم: {fmt(hf['bubble_toman'])} تومان ({pct(hf['bubble_pct'])})")
-        if qr: lines.append(f"• ربع: {fmt(qr['bubble_toman'])} تومان ({pct_]()
+        if qr: lines.append(f"• ربع: {fmt(qr['bubble_toman'])} تومان ({pct(qr['bubble_pct'])})")
+    except Exception as e:
+        lines += [f"— ④/⑤ سکه: خطا: {e!r}"]
+    # ETF کهربا
+    k = fetch_kahroba()
+    lines += [
+        "—",
+        f"⑥ صندوق طلا «{k.get('symbol','کهربا')}»:",
+        f"• قیمت: {fmt(k['price_toman'])} تومان",
+        f"• NAV: {fmt(k['nav_toman'])} تومان",
+        f"• اختلاف با NAV: {'N/A' if k['prem_toman'] is None else (fmt(k['prem_toman'])+' تومان')} ({pct(k['prem_pct'])})",
+    ]
+    return "\n".join(lines)
+
+# ===== Telegram =====
+async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.reply_text(build_message())
+    except Exception as e:
+        dprint("handler error:", repr(e))
+        try:
+            await update.message.reply_text("متأسفانه خطا رخ داد. دوباره امتحان کنید.")
+        except Exception:
+            pass
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("سلام! «طلا» یا «/gold» را بفرست.")
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    dprint("GLOBAL ERROR:", repr(context.error))
+
+def make_application():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("gold", send_reply))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, send_reply))
+    app.add_error_handler(on_error)
+    return app
+
+# ===== Tiny HTTP server (Render binding) =====
+PORT = int(os.environ.get("PORT", "8080"))
+
+class _Handler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stdout.write("[HTTP] " + (fmt % args) + "\n"); sys.stdout.flush()
+    def do_GET(self):
+        msg = "ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(msg)))
+        self.end_headers()
+        self.wfile.write(msg.encode("utf-8"))
+
+def _start_http_server():
+    def _run():
+        with socketserver.TCPServer(("", PORT), _Handler) as httpd:
+            dprint(f"HTTP server listening on 0.0.0.0:{PORT}")
+            httpd.serve_forever()
+    threading.Thread(target=_run, daemon=True).start()
+
+# ===== Main =====
+if __name__ == "__main__":
+    try:
+        dprint("Starting tiny HTTP server + Telegram polling ...")
+        _start_http_server()
+        application = make_application()
+
+        # حذف وبهوک به صورت همگام (بدون asyncio) تا تداخلی با حلقه event نداشته باشد
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook?drop_pending_updates=true"
+            r = requests.get(url, timeout=10)
+            dprint("deleteWebhook:", r.status_code, (r.text or "")[:120])
+        except Exception as e:
+            dprint("deleteWebhook warn:", repr(e))
+
+        # توجه: بدون drop_pending_updates تا تماس اضافی اولیه نداشته باشد
+        application.run_polling()
+
+    except Exception as e:
+        dprint("FATAL EXCEPTION:", repr(e))
+        time.sleep(10)
+        raise
